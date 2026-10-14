@@ -8,6 +8,8 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib import colors
 
 from almacenamiento import cargar_datos, guardar_datos, usando_github, exportar_json
+import pandas as pd
+import finanzas
 
 DATA_FILE = "data.json"
 
@@ -95,7 +97,8 @@ def evaluar_regla_liberacion_miercoles(datos):
                 a_eliminar_cli = []
                 for cli, info in clientes_data.items():
                     pagado = info.get("pagado", False) if isinstance(info, dict) else False
-                    if not pagado:
+                    entregado = info.get("entregado", False) if isinstance(info, dict) else False
+                    if not pagado and not entregado:  # lo ya entregado NO se libera (el cliente ya lo tiene)
                         cant = info.get("cantidad", 1) if isinstance(info, dict) else info
                         datos["liberados_no_recogidos"].append({
                             "cliente": cli,
@@ -115,7 +118,7 @@ def evaluar_regla_liberacion_miercoles(datos):
                     nuevos_items = []
                     for item in clientes_data:
                         pagado = item.get("pagado", False)
-                        if not pagado:
+                        if not pagado and not item.get("entregado", False):  # lo ya entregado NO se libera
                             datos["liberados_no_recogidos"].append({
                                 "cliente": item.get("cliente", ""),
                                 "producto": p_nombre,
@@ -229,7 +232,7 @@ def generar_pdf_resumen(datos):
         if tipo == "normal":
             precio = p_info.get("precio", 0.0)
             for cli, info in clientes_data.items():
-                if isinstance(info, dict) and info.get("entregado", False):
+                if isinstance(info, dict) and info.get("entregado", False) and info.get("pagado", False):
                     continue
                 if cli not in cuentas_clientes:
                     cuentas_clientes[cli] = []
@@ -240,7 +243,7 @@ def generar_pdf_resumen(datos):
         else:
             if isinstance(clientes_data, list):
                 for item in clientes_data:
-                    if item.get("entregado", False):
+                    if item.get("entregado", False) and item.get("pagado", False):
                         continue
                     cli = item.get("cliente", "")
                     detalle = item.get("detalle", "")
@@ -255,7 +258,7 @@ def generar_pdf_resumen(datos):
                         cuentas_clientes[cli].append((nombre_prod_completo, cant, precio, subtotal, pagado))
             elif isinstance(clientes_data, dict):
                 for cli, info_cli in clientes_data.items():
-                    if isinstance(info_cli, dict) and info_cli.get("entregado", False):
+                    if isinstance(info_cli, dict) and info_cli.get("entregado", False) and info_cli.get("pagado", False):
                         continue
                     if cli not in cuentas_clientes:
                         cuentas_clientes[cli] = []
@@ -324,6 +327,9 @@ if "data" not in st.session_state:
     st.session_state.data = cargar_datos()
 
 datos = st.session_state.data
+
+if finanzas.migrar_cobros(datos):
+    guardar_datos(datos)
 
 evaluar_regla_liberacion_miercoles(datos)
 verificar_y_archivar_productos(datos)
@@ -856,9 +862,9 @@ with tab_buscador:
                 with col_bt1:
                     submit_guardar_cliente = st.form_submit_button("💾 Guardar Estatus", type="primary")
                 with col_bt2:
-                    submit_todo_pagado = st.form_submit_button("💵 Todo Pagado")
+                    submit_todo_pagado = st.form_submit_button("💵 Pagar lo disponible")
                 with col_bt3:
-                    submit_todo_pagado_entregado = st.form_submit_button("⚡ Pagado y Entregado")
+                    submit_todo_pagado_entregado = st.form_submit_button("⚡ Pagado y Entregado (disponible)")
                 
                 if submit_guardar_cliente or submit_todo_pagado or submit_todo_pagado_entregado:
                     for estado in nuevos_estados:
@@ -866,7 +872,12 @@ with tab_buscador:
                         p_nom = it["prod_nombre"]
                         p_info = datos["productos"][p_nom]
                         
-                        if submit_todo_pagado_entregado:
+                        if (submit_todo_pagado_entregado or submit_todo_pagado) and not it["disponible"]:
+                            # Los botones masivos NO tocan lo que aún no ha llegado (en tránsito)
+                            entregado_val = it["entregado"]
+                            pagado_val = it["pagado"]
+                            cancelar_val = False
+                        elif submit_todo_pagado_entregado:
                             entregado_val = True
                             pagado_val = True
                             cancelar_val = False
@@ -878,6 +889,12 @@ with tab_buscador:
                             entregado_val = estado["entregado"]
                             pagado_val = estado["pagado"]
                             cancelar_val = estado["cancelar"]
+
+                        # --- Registro de cobros con fecha (para el balance semanal) ---
+                        if it["pagado"] and (cancelar_val or not pagado_val):
+                            finanzas.quitar_cobro(datos, cliente_final_busq, p_nom, it["detalle"], it["cant"], it["subtotal"])
+                        elif (not it["pagado"]) and pagado_val and not cancelar_val:
+                            finanzas.registrar_cobro(datos, cliente_final_busq, p_nom, it["detalle"], it["cant"], it["subtotal"])
 
                         if cancelar_val:
                             if it["tipo"] == "normal":
@@ -903,9 +920,9 @@ with tab_buscador:
                     guardar_datos(datos)
                     verificar_y_archivar_productos(datos)
                     if submit_todo_pagado_entregado:
-                        st.success(f"¡Todo lo de '{cliente_final_busq}' ha sido marcado como Pagado y Entregado exitosamente!")
+                        st.success(f"¡Lo disponible de '{cliente_final_busq}' ha sido marcado como Pagado y Entregado! (Lo que aún está en tránsito no se modificó)")
                     elif submit_todo_pagado:
-                        st.success(f"¡Todo lo de '{cliente_final_busq}' ha sido marcado como Pagado exitosamente!")
+                        st.success(f"¡Lo disponible de '{cliente_final_busq}' ha sido marcado como Pagado! (Lo que aún está en tránsito no se modificó)")
                     else:
                         st.success("¡Todos los estatus de la cuenta han sido actualizados exitosamente!")
                     st.rerun()
@@ -925,10 +942,13 @@ with tab_buscador:
                 ent = item["entregado"]
                 disp = item["disponible"]
                 
-                if ent:
-                    continue
+                if ent and pag:
+                    continue  # entregado y pagado: cuenta cerrada
                 
-                if not disp:
+                if ent:
+                    lineas_resumen.append(f"• **{p_nom}{det}** x{cant} — 📦 *Entregado, falta pago* — **${subt:,.2f}**")
+                    total_pendiente += subt
+                elif not disp:
                     lineas_resumen.append(f"• **{p_nom}{det}** x{cant} — ⏳ *En tránsito (Llega {item['fecha_llegada']}) - No cobrable aún*")
                 elif pag:
                     lineas_resumen.append(f"• **{p_nom}{det}** x{cant} — *(pagado)*")
@@ -937,13 +957,13 @@ with tab_buscador:
                     total_pendiente += subt
 
             if not lineas_resumen:
-                st.success("✨ ¡Todo lo que tenía este cliente ya fue entregado!")
+                st.success("✨ ¡Todo lo que tenía este cliente ya fue entregado y pagado!")
             else:
                 for linea in lineas_resumen:
                     st.markdown(linea)
                 
                 st.markdown(f"#### 💵 **Total a Cobrar: ${total_pendiente:,.2f}**")
-                st.caption("Los productos entregados ya no aparecen. Los marcados como (pagado) o en tránsito no suman al total a cobrar.")
+                st.caption("Los productos entregados y pagados ya no aparecen. Los entregados sin pago sí aparecen y suman al total a cobrar. Los marcados como (pagado) o en tránsito no suman.")
 
 with tab_proximas:
     st.subheader("🚚 Próximas Entregas y Logística Programada")
@@ -1112,46 +1132,98 @@ with tab_disponibles:
 with tab_historial:
     st.subheader("📊 Historial General y Ganancias Mensuales")
     st.write("Aquí se archivan automáticamente los productos y lotes cuyos pedidos ya fueron **100% entregados y pagados** por todos los clientes.")
-    
+
     historial = datos.get("historial_mensual", [])
-    
-    if not historial:
-        st.info("Aún no hay productos archivados este mes. Cuando todos los clientes de un producto tengan sus estatus en Entregado y Pagado, aparecerá aquí el resumen financiero.")
+
+    # ---------- Balance general (no depende del mes) ----------
+    inv_total = finanzas.inversion_total(datos)
+    cobrado_tot = finanzas.cobrado_total(datos)
+    balance_tot = cobrado_tot - inv_total
+
+    st.markdown("### 🧮 Balance General: ¿ya recuperé mi inversión?")
+    bg1, bg2, bg3 = st.columns(3)
+    bg1.metric("💸 Inversión total", f"${inv_total:,.2f}")
+    bg2.metric("💵 Cobrado total", f"${cobrado_tot:,.2f}")
+    if balance_tot < 0:
+        bg3.metric("⏳ Falta por recuperar", f"${-balance_tot:,.2f}")
     else:
-        meses_disponibles = sorted(list(set(item.get("mes", "General") for item in historial)), reverse=True)
+        bg3.metric("✅ Ganancia (inversión recuperada)", f"${balance_tot:,.2f}")
+    st.caption("La inversión suma todos los productos, incluso los que aún no llegan. Lo cobrado cuenta solo lo marcado como Pagado.")
+
+    base_info = datos.get("cobro_base", {})
+    if base_info.get("monto", 0) > 0:
+        with st.expander(f"Cobros anteriores a la actualización (sin fecha): ${base_info['monto']:,.2f}"):
+            st.caption("Lo que ya estaba pagado antes de activar el balance semanal no tiene fecha, por eso va junto aquí.")
+            for nombre_b, cant_b in sorted(base_info.get("detalle", {}).items()):
+                st.write(f"• {cant_b} {nombre_b}")
+
+    st.markdown("---")
+
+    # ---------- Selector de mes (meses con productos archivados o con cobros) ----------
+    meses_disponibles = finanzas.meses_disponibles(datos)
+
+    if not meses_disponibles:
+        st.info("Aún no hay productos archivados ni cobros registrados. Cuando marques pagos, aquí aparecerá el balance por semana.")
+    else:
         mes_sel = st.selectbox("Seleccionar Mes a Consultar", options=meses_disponibles)
-        
+
         items_mes = [h for h in historial if h.get("mes") == mes_sel]
-        
-        t_hist = []
-        tot_costo = 0.0
-        tot_venta = 0.0
-        tot_ganancia = 0.0
-        tot_cant = 0
-        
-        for h in items_mes:
-            tot_cant += h.get("cantidad", 0)
-            tot_costo += h.get("costo", 0.0)
-            tot_venta += h.get("venta", 0.0)
-            tot_ganancia += h.get("ganancia", 0.0)
-            
-            t_hist.append({
-                "Producto": h.get("producto"),
-                "Cant. Total": h.get("cantidad"),
-                "Costo Inversión": f"${h.get('costo', 0.0):,.2f}",
-                "Venta Total": f"${h.get('venta', 0.0):,.2f}",
-                "Ganancia Neta": f"${h.get('ganancia', 0.0):,.2f}",
-                "Fecha Archivo": h.get("fecha_archivo")
-            })
-            
-        st.dataframe(t_hist, use_container_width=True)
-        
-        st.markdown("### 💰 Resumen Financiero del Mes: " + mes_sel)
-        mc1, mc2, mc3, mc4 = st.columns(4)
-        mc1.metric("📦 Unidades Vendidas", tot_cant)
-        mc2.metric("💸 Inversión Total", f"${tot_costo:,.2f}")
-        mc3.metric("💵 Venta Total", f"${tot_venta:,.2f}")
-        mc4.metric("📈 Ganancia Neta Limpia", f"${tot_ganancia:,.2f}")
+
+        if items_mes:
+            t_hist = []
+            tot_costo = 0.0
+            tot_venta = 0.0
+            tot_ganancia = 0.0
+            tot_cant = 0
+
+            for h in items_mes:
+                tot_cant += h.get("cantidad", 0)
+                tot_costo += h.get("costo", 0.0)
+                tot_venta += h.get("venta", 0.0)
+                tot_ganancia += h.get("ganancia", 0.0)
+
+                t_hist.append({
+                    "Producto": h.get("producto"),
+                    "Cant. Total": h.get("cantidad"),
+                    "Costo Inversión": f"${h.get('costo', 0.0):,.2f}",
+                    "Venta Total": f"${h.get('venta', 0.0):,.2f}",
+                    "Ganancia Neta": f"${h.get('ganancia', 0.0):,.2f}",
+                    "Fecha Archivo": h.get("fecha_archivo")
+                })
+
+            st.dataframe(t_hist, use_container_width=True)
+
+            st.markdown("### 💰 Resumen Financiero del Mes: " + mes_sel)
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("📦 Unidades Vendidas", tot_cant)
+            mc2.metric("💸 Inversión Total", f"${tot_costo:,.2f}")
+            mc3.metric("💵 Venta Total", f"${tot_venta:,.2f}")
+            mc4.metric("📈 Ganancia Neta Limpia", f"${tot_ganancia:,.2f}")
+        else:
+            st.caption("En este mes no se archivó ningún producto completo; abajo ves lo que se cobró.")
+
+        # ---------- Balance semanal del mes ----------
+        parsed = finanzas.parsear_mes(mes_sel)
+        if parsed:
+            semanas = finanzas.resumen_semanal(datos, parsed[0], parsed[1])
+            st.markdown(f"### 📅 Cobros por semana: {mes_sel}")
+            if not semanas:
+                st.info("Este mes aún no empieza.")
+            else:
+                etiquetas = [f"S{w['numero']} · {w['rotulo']}" for w in semanas]
+                st.markdown("**💵 Cobrado cada semana**")
+                st.bar_chart(pd.DataFrame({"Cobrado": [w["cobrado"] for w in semanas]}, index=etiquetas))
+                st.markdown("**📉 Balance acumulado** (0 = inversión recuperada)")
+                st.line_chart(pd.DataFrame({"Balance": [w["balance"] for w in semanas]}, index=etiquetas))
+
+                st.markdown("**🛒 Lo que se cobró cada semana**")
+                for w in semanas:
+                    if w["vendido"]:
+                        st.markdown(f"**Semana {w['rotulo']} · cobrado ${w['cobrado']:,.2f}**")
+                        for nombre_v, cant_v in w["vendido"]:
+                            st.write(f"• {cant_v} {nombre_v}")
+                    else:
+                        st.markdown(f"**Semana {w['rotulo']}** · sin cobros")
 with tab_clientes:
     st.subheader("👥 Administración General de Clientes")
     st.write("Registra nuevos clientes aquí o consulta la base de datos completa de clientes cargada.")
