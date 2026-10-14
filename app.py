@@ -37,6 +37,13 @@ def evaluar_regla_liberacion_miercoles(datos):
     - Si un pedido llega en Miércoles (2), Jueves (3), Viernes (4) o Sábado (5), se libera en el miércoles correspondiente.
     '''
     ahora = datetime.now()
+
+    # Corrección única (v2): productos sin fecha de llegada ahora usan una fecha de referencia FIJA.
+    # Se reinicia el control del miércoles una sola vez para que la regla corregida se aplique de inmediato.
+    if not datos.get("regla_liberacion_v2", False):
+        datos["regla_liberacion_v2"] = True
+        datos["ultima_liberacion_timestamp"] = ""
+        guardar_datos(datos)
     
     # ÚNICAMENTE liberar si el día actual es Miércoles a partir de las 9:00 AM, o si ya pasó esa hora del miércoles actual.
     # weekday: 0=Lun, 1=Mar, 2=Mié, 3=Jue, 4=Vie, 5=Sáb, 6=Dom
@@ -63,8 +70,17 @@ def evaluar_regla_liberacion_miercoles(datos):
         fecha_lleg_str = p_info.get("fecha_llegada", "")
         
         if not fecha_lleg_str or fecha_lleg_str == "Por definir" or fecha_lleg_str.strip() == "":
-            # Asumimos que llegó durante la semana de trabajo actual
-            f_ref = ultimo_miercoles_9am.date() - timedelta(days=3) # Ref: Domingo/Lunes previo
+            # Sin fecha de llegada: se usa la fecha en que se registró el producto (fecha_referencia).
+            # Productos antiguos sin esa fecha: se asume que llegaron la semana pasada (se evalúan ya).
+            ref_str = p_info.get("fecha_referencia", "")
+            if not ref_str:
+                ref_str = (ultimo_miercoles_9am.date() - timedelta(days=7)).strftime("%Y-%m-%d")
+                p_info["fecha_referencia"] = ref_str
+                hubo_cambios = True  # para que se guarde la fecha de referencia
+            try:
+                f_ref = datetime.strptime(ref_str, "%Y-%m-%d").date()
+            except Exception:
+                f_ref = ultimo_miercoles_9am.date() - timedelta(days=7)
         else:
             try:
                 f_ref = datetime.strptime(fecha_lleg_str, "%Y-%m-%d").date()
@@ -433,6 +449,7 @@ with tab_gestion:
                             "costo_inversion": costo_inv,
                             "unidades_compradas": unidades_comp,
                             "fecha_llegada": f_str,
+                            "fecha_referencia": datetime.now().strftime("%Y-%m-%d"),
                             "clientes": [] if es_catalogo else {}
                         }
                         guardar_datos(datos)
@@ -565,6 +582,8 @@ with tab_gestion:
                     prod_info["unidades_compradas"] = new_uc
                     prod_info["costo_inversion"] = new_ci
                     prod_info["fecha_llegada"] = new_fl.strftime("%Y-%m-%d") if new_tiene_f else ""
+                    if not new_tiene_f and not prod_info.get("fecha_referencia"):
+                        prod_info["fecha_referencia"] = datetime.now().strftime("%Y-%m-%d")
                     if tipo_prod == "normal":
                         prod_info["precio"] = new_pr
                     guardar_datos(datos)
